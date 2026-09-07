@@ -1,0 +1,1 @@
+.stats-row{display:flex;align-items:center;flex-wrap:wrap;gap:24px;margin:26px 0 0 44px;color:#56718d;font-size:12px}.stat-item{display:flex;align-items:center;gap:7px}.stat-icon{color:#4f6f8d;width:16px;height:16px}@media(max-width:780px){.stats-row{margin-left:44px;gap:12px}}
