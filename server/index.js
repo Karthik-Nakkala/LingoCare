@@ -266,10 +266,11 @@ app.post("/api/generate-curriculum", async (req, res) => {
 });
 
 // SPA Fallback for production client routing
-app.get("*", (req, res, next) => {
+app.get("/{*splat}", (req, res, next) => {
   if (req.path.startsWith("/api")) return next();
+
   res.sendFile(path.join(distPath, "index.html"), (err) => {
-    if (err) next();
+    if (err) next(err);
   });
 });
 
