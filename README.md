@@ -29,7 +29,7 @@ The client runs on `http://localhost:5173` and proxies API requests to `http://1
 
 ## Architecture & Production Hardening
 
-- **Gemini Integration**: Calls Gemini via `@google/genai` (defaulting to `gemini-2.5-flash`) with structured schema constraints.
+- **Gemini Integration**: Calls Gemini via `@google/genai` (defaulting to `gemini-3.6-flash`) with structured schema constraints.
 - **Client-Side PDF Text Extraction**: Uses `pdfjs-dist` to extract clean page text in the browser. Raw PDF files never leave the browser.
 - **Strict Data Isolation**: AI drafts remain in `generatedCurriculumDraft` until the user explicitly clicks **Replace current curriculum**.
 - **Error Resilience & Safety**:

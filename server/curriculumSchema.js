@@ -4,7 +4,7 @@ import { z } from 'zod';
 export const MAX_DOCUMENT_CHARACTERS = 200000; // approx 200k characters (~30–40 pages)
 
 // Gemini Model Configuration - single source of truth for backend
-export const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+export const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
 
 // Allowed provenance values for any curriculum item
 export const provenanceEnum = z.enum(['pdf', 'ai-inferred', 'user-edited']);
