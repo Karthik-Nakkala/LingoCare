@@ -47,7 +47,7 @@ export function CurriculumPage() {
             </div>
           </div>
           
-          <StatsRow empty={showStartScreen} />
+          <StatsRow />
           <Tabs activeTab={activeTab} setActiveTab={selectTab} />
         </div>
 

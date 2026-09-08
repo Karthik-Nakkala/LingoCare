@@ -5,8 +5,11 @@ import { calculateCurriculumStats } from '../../utils/stats';
 import './SidebarOverview.css';
 
 export function SidebarOverview({ onAddModule, onSwitchTab }) {
-  const { curriculum, resetToEmpty, resetToSample } = useCurriculum();
-  const stats = calculateCurriculumStats(curriculum);
+  const { curriculum, generatedCurriculumDraft, resetToEmpty, resetToSample } = useCurriculum();
+  const targetCurriculum = curriculum.modules?.length
+    ? curriculum
+    : (generatedCurriculumDraft?.curriculum || generatedCurriculumDraft || curriculum);
+  const stats = calculateCurriculumStats(targetCurriculum);
 
   return (
     <aside className="sidebar-overview">

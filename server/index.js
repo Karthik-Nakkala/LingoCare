@@ -7,6 +7,7 @@ import { GoogleGenAI } from "@google/genai";
 import { buildCurriculumPrompt } from "./geminiPrompt.js";
 import {
   curriculumResponseSchema,
+  curriculumGeminiSchema,
   GEMINI_MODEL,
   MAX_DOCUMENT_CHARACTERS,
   normalizeCurriculumOutput,
@@ -57,64 +58,95 @@ const retryableNetworkCodes = new Set([
   "ENOTFOUND",
 ]);
 
-async function generateWithRetry(ai, request) {
+// Classify whether a Gemini/network error is worth retrying
+function isRetryable(error) {
+  const code =
+    error?.cause?.code ||
+    error?.code ||
+    (typeof error?.status === 'number' ? String(error.status) : undefined);
+  // 429 = rate limit, 503 = upstream unavailable — both retryable
+  if (code === '429' || code === '503') return true;
+  if (retryableNetworkCodes.has(code)) return true;
+  const msg = error?.message || '';
+  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('UNAVAILABLE')) return true;
+  return false;
+}
+
+async function generateWithRetry(ai, request, signal, tracker) {
   const maxAttempts = 3;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (signal?.aborted) {
+      throw new Error("AI_TIMEOUT");
+    }
+    if (tracker) tracker.attempt = attempt + 1;
     try {
-      return await ai.models.generateContent(request);
+      return await ai.models.generateContent({
+        ...request,
+        ...(signal ? { signal } : {}),
+      });
     } catch (error) {
-      const code =
-        error?.cause?.code ||
-        error?.code ||
-        (error?.status?.toString && error.status.toString());
-      if (code === "429" || retryableNetworkCodes.has(code)) {
-        if (attempt === maxAttempts - 1) throw error;
-        // Exponential backoff: 700ms, 1400ms
-        await new Promise((r) => setTimeout(r, 700 * (attempt + 1)));
-        continue;
+      if (signal?.aborted || error?.name === "AbortError" || error?.message === "AI_TIMEOUT") {
+        throw new Error("AI_TIMEOUT");
       }
-      throw error;
+      if (!isRetryable(error) || attempt === maxAttempts - 1) throw error;
+      // Exponential backoff with jitter: ~700ms, ~1400ms
+      const base = 700 * (attempt + 1);
+      const jitter = Math.floor(Math.random() * 300);
+
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, base + jitter);
+        if (signal) {
+          signal.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              reject(new Error("AI_TIMEOUT"));
+            },
+            { once: true }
+          );
+        }
+      });
     }
   }
 }
 
 // Map internal / Gemini exceptions to user-safe contract
 function mapGeminiError(error) {
-  if (error?.message === "AI_TIMEOUT") {
+  if (error?.message === 'AI_TIMEOUT' || error?.name === 'AbortError') {
     return {
       status: 504,
-      errorCode: "AI_TIMEOUT",
-      userMessage: "AI generation took too long to respond. Please try again.",
+      errorCode: 'AI_TIMEOUT',
+      userMessage: 'AI generation took too long to respond. Please try again.',
     };
   }
 
   const code =
     error?.cause?.code ||
     error?.code ||
-    (error?.status?.toString && error.status.toString());
+    (typeof error?.status === 'number' ? String(error.status) : undefined);
+  const msg = error?.message || '';
 
-  if (code === "429" || error?.message?.includes("RESOURCE_EXHAUSTED")) {
+  if (code === '429' || msg.includes('RESOURCE_EXHAUSTED')) {
     return {
       status: 429,
-      errorCode: "AI_RATE_LIMITED",
-      userMessage: "AI generation is busy right now. Please try again shortly.",
+      errorCode: 'AI_RATE_LIMITED',
+      userMessage: 'AI generation is busy right now. Please try again shortly.',
     };
   }
 
-  if (retryableNetworkCodes.has(code)) {
+  // 503 from Gemini upstream = service unavailable (retries already exhausted)
+  if (code === '503' || msg.includes('UNAVAILABLE') || retryableNetworkCodes.has(code)) {
     return {
       status: 503,
-      errorCode: "AI_NETWORK_UNAVAILABLE",
-      userMessage:
-        "AI generation is temporarily unavailable. Please check your connection and try again.",
+      errorCode: 'AI_UNAVAILABLE',
+      userMessage: 'AI generation is temporarily unavailable. Please try again in a moment.',
     };
   }
 
   return {
     status: 502,
-    errorCode: "GENERATION_FAILED",
-    userMessage:
-      "AI couldn't generate a curriculum from this document. Please try again.",
+    errorCode: 'GENERATION_FAILED',
+    userMessage: "AI couldn't generate a curriculum from this document. Please try again.",
   };
 }
 
@@ -177,35 +209,58 @@ app.post("/api/generate-curriculum", async (req, res) => {
 
   isGenerating = true;
 
-  // 4. Server-side timeout (30 seconds)
-  const timeoutMs = 30_000;
+  // 4. Server-side deadline (90 seconds maximum bounded timeout)
+  const timeoutMs = 90_000;
+  const startTime = Date.now();
+  const tracker = { attempt: 0 };
+  const controller = new AbortController();
+
   let timeoutHandle;
   const timeoutPromise = new Promise((_, reject) => {
-    timeoutHandle = setTimeout(
-      () => reject(new Error("AI_TIMEOUT")),
-      timeoutMs,
-    );
+    timeoutHandle = setTimeout(() => {
+      controller.abort();
+      const elapsed = Date.now() - startTime;
+      console.error(
+        `[Timeout Diagnostic] Gemini generation timed out after ${elapsed}ms | documentChars=${document.fullText.length} | model=${GEMINI_MODEL} | attemptCount=${tracker.attempt}`
+      );
+      reject(new Error("AI_TIMEOUT"));
+    }, timeoutMs);
   });
 
   try {
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-    const generationCall = generateWithRetry(ai, {
-      model: GEMINI_MODEL,
-      contents: buildCurriculumPrompt(document),
-      config: {
-        responseMimeType: "application/json",
-        responseJsonSchema: curriculumResponseSchema,
-        temperature: 0.15,
+    const generationCall = generateWithRetry(
+      ai,
+      {
+        model: GEMINI_MODEL,
+        contents: buildCurriculumPrompt(document),
+        config: {
+          responseMimeType: 'application/json',
+          responseJsonSchema: curriculumGeminiSchema,
+          thinkingConfig: { thinkingLevel: 'low' },
+        },
       },
-    });
+      controller.signal,
+      tracker
+    );
 
     const result = await Promise.race([generationCall, timeoutPromise]);
     clearTimeout(timeoutHandle);
 
+    const rawText = result?.text || "";
+    const textReturned = Boolean(rawText && rawText.trim());
+    console.log(`[Diagnostic] Gemini returned text: ${textReturned}`);
+    if (textReturned) {
+      console.log(`[Diagnostic] Generated JSON preview (first 2000 chars):\n${rawText.slice(0, 2000)}`);
+    }
+
     let parsed = {};
     try {
-      parsed = JSON.parse(result.text || "{}");
-    } catch {
+      parsed = JSON.parse(rawText || "{}");
+      console.log(`[Diagnostic] JSON.parse succeeded: true`);
+      console.log(`[Diagnostic] Top-level keys: [${Object.keys(parsed || {}).join(', ')}]`);
+    } catch (parseErr) {
+      console.error(`[Diagnostic] JSON.parse succeeded: false - Error: ${parseErr.message}`);
       return clientError(
         res,
         422,
@@ -214,12 +269,29 @@ app.post("/api/generate-curriculum", async (req, res) => {
       );
     }
 
+    // Zod Schema Validation Diagnostic
+    const zodResult = curriculumResponseSchema.safeParse(parsed);
+    console.log(`[Diagnostic] Zod validation success: ${zodResult.success}`);
+    if (!zodResult.success) {
+      console.log(`[Diagnostic] Zod validation issues count: ${zodResult.error.issues.length}`);
+      zodResult.error.issues.forEach((issue, idx) => {
+        console.log(
+          `  Issue #${idx + 1}: path="${issue.path.join('.') || '(root)'}" | code=${issue.code} | expected="${issue.expected}" | received="${issue.received}" | message="${issue.message}"`
+        );
+      });
+    }
+
     // Normalize first to assign IDs and safe defaults
     const normalized = normalizeCurriculumOutput(parsed);
 
     // Validate structural rules
     const validation = validateCurriculumOutput(normalized);
+    console.log(`[Diagnostic] Structural validation success: ${validation.valid}`);
     if (!validation.valid) {
+      console.log(`[Diagnostic] Structural validation issues count: ${validation.issues.length}`);
+      validation.issues.forEach((iss, idx) => {
+        console.log(`  Structural Issue #${idx + 1}: path="${iss.path}" | message="${iss.message}"`);
+      });
       return clientError(
         res,
         422,
@@ -265,9 +337,9 @@ app.post("/api/generate-curriculum", async (req, res) => {
   }
 });
 
-// SPA Fallback for production client routing
-app.get("/{*splat}", (req, res, next) => {
-  if (req.path.startsWith("/api")) return next();
+// SPA Fallback for production client routing (Middleware fallback for Express 5)
+app.use((req, res, next) => {
+  if (req.method !== "GET" || req.path.startsWith("/api")) return next();
 
   res.sendFile(path.join(distPath, "index.html"), (err) => {
     if (err) next(err);
@@ -287,8 +359,25 @@ app.use((err, req, res, next) => {
 });
 
 const port = Number(process.env.PORT || process.env.API_PORT || 8788);
-app.listen(port, "0.0.0.0", () => {
+
+const server = app.listen(port, "0.0.0.0", () => {
   console.log(
     `Lingocare engine running on port ${port} (Model: ${GEMINI_MODEL})`,
   );
 });
+
+server.on("error", (err) => {
+  console.error("[Server] Critical socket / startup error:", err);
+  process.exit(1);
+});
+
+const handleShutdown = (signal) => {
+  console.log(`[Server] Received ${signal}. Closing HTTP server...`);
+  server.close(() => {
+    console.log("[Server] Express HTTP server closed gracefully.");
+    process.exit(0);
+  });
+};
+
+process.on("SIGINT", () => handleShutdown("SIGINT"));
+process.on("SIGTERM", () => handleShutdown("SIGTERM"));
